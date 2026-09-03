@@ -1,0 +1,475 @@
+---
+title: "Data Wrangling - Team 2 DS 440"
+author: "Jason Ficorilli"
+format: html
+editor: source
+---
+
+# Loading relevant packages
+
+```{r, warning=FALSE, message=FALSE}
+library(tidyverse)
+```
+
+# Load ridership data
+
+```{r}
+stations_df <- read.csv("MTA_Subway_Stations_20260227.csv")
+training_ridership_raw_df <- read.csv("2022-2024_MTA_Subway_Hourly_Ridership.csv")
+testing_ridership_raw_df <- read.csv("2025_MTA_Subway_Hourly_Ridership.csv")
+```
+
+
+# Combine training and testing ridership into one source
+
+These sources will be separated at a later point in the process, but are being combined temporarily for more convenient data pre-processing.
+
+```{r}
+total_ridership_df <- bind_rows(training_ridership_raw_df, testing_ridership_raw_df)
+```
+
+# Check if any stations have problems with low presence in the data
+
+```{r}
+total_ridership_df %>%
+  group_by(station_complex_id) %>%
+  summarize(N = n()) %>%
+  arrange(N) %>%
+  head(10)
+```
+
+One station, "Tompkinsville (SIR)", is a part of the Staten Island Railway (which is not being considered in this study) and must be removed. 
+
+
+# Create ridership df with fixed (POSIX) timestamps and stations without Staten Island railway
+
+```{r}
+df_cleaned <- total_ridership_df %>% 
+  # Change timestamp to POSIXct type
+  mutate(transit_timestamp_posixct = as.POSIXct(strptime(transit_timestamp, "%m/%d/%Y %I:%M:%S %p"), tz = "EST")) %>%
+
+  # Extract year, month, day, and hour
+  mutate(year = year(transit_timestamp_posixct), month = month(transit_timestamp_posixct), day = day(transit_timestamp_posixct), hour = hour(transit_timestamp_posixct)) %>%
+  
+  # Change ridership to integer
+  mutate(total_complex_ridership = as.integer(gsub(",", "", sum_ridership))) %>%
+  
+  # Remove Tompkinsville station
+  filter(station_complex_id != 502) %>%
+  
+  # Remove old ridership variable
+  select(!c("sum_ridership"))
+```
+
+
+```{r}
+# Remove SIR stations from the station information dataframe
+stations_df_no_SI <- stations_df %>% filter(Borough != "SI")
+```
+
+
+# Create complex id list without missing station complexes, using 2025 naming conventions 
+
+Check that the station complex id's from 2024 (past data) and 2025 are the same
+
+```{r}
+ identical(df_cleaned %>%
+  filter(year == 2025) %>%
+  group_by(station_complex_id) %>%
+  summarize(), 
+  df_cleaned %>%
+  filter(year == 2024) %>%
+  group_by(station_complex_id) %>%
+  summarize())
+```
+
+Station complex ids are the same, but names have slightly changed
+
+```{r, message=FALSE}
+station_complex_id_name_df <- df_cleaned %>%
+  filter(year == 2025) %>%
+  group_by(station_complex_id, station_complex) %>%
+  summarize()
+```
+
+
+# Check for null columns
+
+```{r}
+apply(is.na(df_cleaned), 2, "FUN"=sum)
+```
+
+
+# Check for time discontinuity (if none, then N should equal 424 (stations) for every time stamp)
+
+```{r}
+df_cleaned %>% 
+  group_by(transit_timestamp) %>%
+  summarize(N = n()) %>%
+  arrange(N) %>%
+  View()
+```
+
+## View counts by station
+
+```{r}
+df_cleaned %>%
+  group_by(station_complex_id) %>%
+  summarize(N = n()) %>%
+  arrange(desc(N)) %>%
+  View()
+```
+
+## Show distribution of missing values in training data
+
+```{r}
+# View missing data counts for only training data
+df_cleaned %>%
+  filter(year == 2022 | year == 2023 | year == 2024) %>%
+  group_by(station_complex_id) %>%
+  summarize(N = n()) %>%
+  arrange(desc(N)) %>%
+  mutate(N_missing = 26301 - N) %>%
+  View()
+```
+
+```{r, message=FALSE}
+# Plot distribution across training data (testing data not analyzed to avoid performing EDA on the testing set)
+ggplot(data = df_cleaned %>%
+  filter(year == 2022 | year == 2023 | year == 2024) %>%
+  group_by(station_complex_id) %>%
+  summarize(N = n()) %>%
+  arrange(desc(N)) %>%
+    mutate(N_missing = 26301 - N), aes(x = N_missing)) +
+  geom_histogram(color = "black", "fill" = "lightblue") +
+  labs(x = "Number of Missing Hourly Observations per Station", y = "Station Count")
+```
+
+
+## Identify days that have missing observtions for a station that has complete observations otherwise (here: "DeKalb Av (B,Q,R)", SCID 26)
+
+```{r}
+df_cleaned %>%
+  filter(station_complex_id == 26) %>%
+  filter(month == 3) %>%
+  group_by(year, month, day) %>%
+  summarize(N = n()) %>%
+  arrange(N) %>%
+  View()
+```
+
+
+## Verify that all stations are missing certain March observations due to Daylight Savings Time
+
+
+```{r}
+df_cleaned %>%
+  filter((year == 2022 & month == 3 & day == 13 & hour == 2) | (year == 2023 & month == 3 & day == 12 & hour == 2) | (year == 2024 & month == 3 & day == 10 & hour == 2))
+```
+
+03/13/2022 at 2:00AM (hour 2): only one station has an observation ("DeKalb Av (B,Q,R)", SCID 26)
+03/12/2023 at 2:00AM: no stations have any observations
+03/10/2024 at 2:00AM: no stations have any observations.
+
+These missing values are due to daylight savings time adjustment in 2022-2024. There are no missing values due to DST ending (since 2:00am becomes 1:00am, and time remains continuous), but rather its start in March of each year.
+
+```{r}
+df_cleaned %>%
+  filter((year == 2025 & month == 3 & day == 9 & hour == 2))
+```
+
+Interestingly, as shown above, there are values recorded in 2025, although this time period did not exist. This suggests that DST changes were ignored for ridership counts beginning in 2025, which was recorded in a separate dataset than the observations for 2022-2024. 
+
+Therefore, observations for 03/13/2022, 03/12/2023, and 03/10/2024 must be added to the dataset.
+
+# Drop station complex name (only ID is necessary as unique identifier)
+
+```{r}
+df_cleaned <- df_cleaned %>% select(!c("station_complex"))
+```
+
+# Add Missing Rows
+
+```{r}
+# Drop 1 observation for DST change on 03/13/2022 at 2:00AM (should not exist)
+df_cleaned <- df_cleaned %>% filter(transit_timestamp != "03/13/2022 02:00:00 AM")
+```
+
+```{r}
+# View total amount of missing rows to be added
+(24*365*424*3 + 24*366*424) - dim(df_cleaned)[1]
+```
+
+```{r}
+# Create list of all timestamps currently present in the data
+timestamp_list <- df_cleaned %>% 
+  group_by(transit_timestamp) %>%
+  summarize(N = n()) %>%
+  filter(N != 424) %>%
+  pull(transit_timestamp)
+```
+
+
+```{r}
+# Be advised - ~50 min computation on i7 processor with 16 GB RAM
+
+# Create lists of missing rows
+transit_timestamp_list <- c()
+station_complex_id_list <- c()
+
+for(tm in timestamp_list){
+  temp_df <- df_cleaned %>% filter(transit_timestamp == tm)
+  for(i in 1:dim(station_complex_id_name_df)[1]){
+    if(!c(station_complex_id_name_df$station_complex_id[i] %in% temp_df$station_complex_id)){
+      transit_timestamp_list <- append(transit_timestamp_list, tm)
+      station_complex_id_list <- append(station_complex_id_list, station_complex_id_name_df$station_complex_id[i])
+    }
+  }
+}
+```
+
+
+```{r}
+# Add missing DST values to the lists
+for(date in c("03/13/2022 2:00:00 AM", "03/12/2023 2:00:00 AM", "03/10/2024 2:00:00 AM")){
+  for(i in 1:dim(station_complex_id_name_df)[1]){
+    transit_timestamp_list <- append(transit_timestamp_list, date)
+    station_complex_id_list <- append(station_complex_id_list, station_complex_id_name_df$station_complex_id[i])
+  }
+}
+```
+
+
+```{r}
+# Add rows
+df_final <- df_cleaned %>%
+  select(c("transit_timestamp", "station_complex_id", "total_complex_ridership")) %>%
+  
+  add_row(transit_timestamp = transit_timestamp_list, station_complex_id = station_complex_id_list) %>%
+  
+  # Change timestamp to POSIXct type
+  mutate(transit_timestamp_posixct = as.POSIXct(strptime(transit_timestamp, "%m/%d/%Y %I:%M:%S %p"), tz = "EST")) %>%
+
+  # Extract year, month, day, and hour
+  mutate(year = year(transit_timestamp_posixct), month = month(transit_timestamp_posixct), day = day(transit_timestamp_posixct), hour = hour(transit_timestamp_posixct)) %>%
+  
+  # Arrange by date and station complex id
+  arrange(transit_timestamp_posixct, station_complex_id)
+```
+
+
+## Check again for time discontinuity (if none, then N should equal 424 (stations) for every time stamp)
+
+```{r}
+df_final %>%
+  group_by(transit_timestamp) %>%
+  summarize(N = n()) %>%
+  View()
+```
+
+
+## Check for null columns (should have 306124 ridership nulls)
+
+```{r}
+apply(is.na(df_final), 2, "FUN"=sum)
+```
+
+
+# Add weather features
+
+## Load weather data sources
+
+
+Weather data was sourced from the Open-Meteo Historical Weather API. Measurements are in standard units, with temperature two meters above ground and wind speeds at 10 meters above ground.
+
+Link: https://open-meteo.com/en/docs/historical-weather-api?hourly=temperature_2m,precipitation,wind_speed_10m&temperature_unit=fahrenheit&wind_speed_unit=mph&precipitation_unit=inch&latitude=40.7143&longitude=-74.006&start_date=2022-01-01&end_date=2025-12-31
+
+```{r}
+weather_data_raw <- read.csv("2022_2025_NYC_Open-Meteo_raw.csv", skip = 3)
+```
+
+
+## Preliminary cleaning of weather sources
+
+
+```{r}
+# Create cleaned df of weather data
+weather_df_clean <- weather_data_raw %>% 
+  
+  # Fix column names
+  rename("temp_2m_F" = "temperature_2m...F.") %>%
+  rename("precipitation_in" = "precipitation..inch.") %>%
+  rename("wind_speed_10m_mph" = "wind_speed_10m..mp.h.") %>%
+  
+  # Change time stamp to POSIXct type
+  mutate(time_posixct_adjusted = as.POSIXct(strptime(gsub("T", " ", time) , format = "%Y-%m-%d %H:%M", tz = "EST"))) %>%
+  
+  # Extract year, month, day, and hour
+  mutate(year = year(time_posixct_adjusted), month = month(time_posixct_adjusted), day = day(time_posixct_adjusted), hour = hour(time_posixct_adjusted))
+  
+```
+
+
+## Check to see if all years have expected observation counts
+
+```{r}
+weather_df_clean %>%
+  group_by(year) %>%
+  summarize(N = n()) %>%
+  View()
+```
+
+
+## Check if there are any nulls
+
+```{r}
+apply(is.na(weather_df_clean), 2, "FUN"=sum)
+```
+
+## Join with ridership data
+
+```{r}
+overall_data_with_nulls_df <- df_final %>%
+  
+  left_join(
+    weather_df_clean %>% select(c("time_posixct_adjusted", "temp_2m_F", "precipitation_in", "wind_speed_10m_mph")), 
+    join_by(transit_timestamp_posixct == time_posixct_adjusted)
+    )
+```
+
+
+# Add stations features
+
+## Create the features
+
+```{r}
+stations_df_no_SI <- stations_df_no_SI %>%
+  # Create borough features for the 4 boroughs in data (Brooklyn is the reference group)
+  mutate(is_station_in_Q = if_else(Borough == "Q", 1, 0)) %>%
+  mutate(is_station_in_M = if_else(Borough == "M", 1, 0)) %>%
+  mutate(is_station_in_Bx = if_else(Borough == "Bx", 1, 0)) %>%
+  
+  # Create binary feature for if station is in Manhattan's CBD
+  mutate(is_station_in_M_CBD = if_else(CBD == "true", 1, 0))
+  
+```
+
+
+## Join with ridership data
+
+```{r, warning=FALSE, message=FALSE}
+overall_data_with_nulls_df <- overall_data_with_nulls_df %>%
+  
+  # Aggregate features by station complex ID (to avoid many-to-many join), then join with ridership data
+  left_join(
+    stations_df_no_SI %>%
+      group_by(Complex.ID, is_station_in_Q, is_station_in_M, is_station_in_Bx, is_station_in_M_CBD) %>%
+      summarize(),
+    join_by(station_complex_id == Complex.ID)
+    )
+```
+
+# Create 42 year, month, weekday, and hour binary features and remove previous year, month, weekday, hour, and POSIXct timestamp variables
+
+```{r}
+overall_data_with_nulls_df <- overall_data_with_nulls_df %>%
+  
+  # Create year binary indicators (2022 is reference year)
+  mutate(is_year_2023 = if_else(year == 2023, 1, 0)) %>%
+  mutate(is_year_2024 = if_else(year == 2024, 1, 0)) %>%
+  mutate(is_year_2025 = if_else(year == 2025, 1, 0)) %>%
+  
+  # Create month binary indicators (January is the reference month)
+  mutate(is_month_Feb = if_else(month == 2, 1, 0)) %>%
+  mutate(is_month_Mar = if_else(month == 3, 1, 0)) %>%
+  mutate(is_month_Apr = if_else(month == 4, 1, 0)) %>%
+  mutate(is_month_May = if_else(month == 5, 1, 0)) %>%
+  mutate(is_month_Jun = if_else(month == 6, 1, 0)) %>%
+  mutate(is_month_Jul = if_else(month == 7, 1, 0)) %>%
+  mutate(is_month_Aug = if_else(month == 8, 1, 0)) %>%
+  mutate(is_month_Sep = if_else(month == 9, 1, 0)) %>%
+  mutate(is_month_Oct = if_else(month == 10, 1, 0)) %>%
+  mutate(is_month_Nov = if_else(month == 11, 1, 0)) %>%
+  mutate(is_month_Dec = if_else(month == 12, 1, 0)) %>%
+  
+  # Create day binary indicators (Sunday (weekday 1) is the reference day)
+  ## Change to is_day_
+  mutate(is_day_Mon = if_else(wday(transit_timestamp_posixct) == 2, 1, 0)) %>%
+  mutate(is_day_Tue = if_else(wday(transit_timestamp_posixct) == 3, 1, 0)) %>%
+  mutate(is_day_Wed = if_else(wday(transit_timestamp_posixct) == 4, 1, 0)) %>%
+  mutate(is_day_Thu = if_else(wday(transit_timestamp_posixct) == 5, 1, 0)) %>%
+  mutate(is_day_Fri = if_else(wday(transit_timestamp_posixct) == 6, 1, 0)) %>%
+  mutate(is_day_Sat = if_else(wday(transit_timestamp_posixct) == 7, 1, 0)) %>%
+  
+  # Create hour binary indicators (12:00:00 AM EST is the reference hour)
+  mutate(is_hour_1am = if_else(hour == 1, 1, 0)) %>%
+  mutate(is_hour_2am = if_else(hour == 2, 1, 0)) %>%
+  mutate(is_hour_3am = if_else(hour == 3, 1, 0)) %>%
+  mutate(is_hour_4am = if_else(hour == 4, 1, 0)) %>%
+  mutate(is_hour_5am = if_else(hour == 5, 1, 0)) %>%
+  mutate(is_hour_6am = if_else(hour == 6, 1, 0)) %>%
+  mutate(is_hour_7am = if_else(hour == 7, 1, 0)) %>%
+  mutate(is_hour_8am = if_else(hour == 8, 1, 0)) %>%
+  mutate(is_hour_9am = if_else(hour == 9, 1, 0)) %>%
+  mutate(is_hour_10am = if_else(hour == 10, 1, 0)) %>%
+  mutate(is_hour_11am = if_else(hour == 11, 1, 0)) %>%
+  mutate(is_hour_12pm = if_else(hour == 12, 1, 0)) %>%
+  mutate(is_hour_1pm = if_else(hour == 13, 1, 0)) %>%
+  mutate(is_hour_2pm = if_else(hour == 14, 1, 0)) %>%
+  mutate(is_hour_3pm = if_else(hour == 15, 1, 0)) %>%
+  mutate(is_hour_4pm = if_else(hour == 16, 1, 0)) %>%
+  mutate(is_hour_5pm = if_else(hour == 17, 1, 0)) %>%
+  mutate(is_hour_6pm = if_else(hour == 18, 1, 0)) %>%
+  mutate(is_hour_7pm = if_else(hour == 19, 1, 0)) %>%
+  mutate(is_hour_8pm = if_else(hour == 20, 1, 0)) %>%
+  mutate(is_hour_9pm = if_else(hour == 21, 1, 0)) %>%
+  mutate(is_hour_10pm = if_else(hour == 22, 1, 0)) %>%
+  mutate(is_hour_11pm = if_else(hour == 23, 1, 0)) %>%
+  
+  # Create rush hour variables
+  mutate(is_during_morning_rush = if_else((hour %in% 5:9) == TRUE, 1, 0)) %>%
+  mutate(is_during_evening_rush = if_else((hour %in% 3:8) == TRUE, 1, 0)) %>%
+  
+  
+  # Drop previously created year, month, day, and hour variables, as well as POSIXct timestamp
+  select(!c("transit_timestamp_posixct", "year", "month", "day", "hour"))
+```
+
+## Final null values check
+(Should only have 306124 ridership NA values)
+
+```{r}
+apply(is.na(overall_data_with_nulls_df), 2, FUN = sum)
+```
+
+# Separate training and testing data
+
+```{r}
+train_data_with_nulls <- overall_data_with_nulls_df %>% filter((is_year_2023 == 0 & is_year_2024 == 0 & is_year_2025 == 0) | is_year_2023 == 1 | is_year_2024 == 1)
+
+test_data_with_nulls <- overall_data_with_nulls_df %>% filter(is_year_2025 == 1)
+```
+
+
+```{r}
+apply(is.na(train_data_with_nulls), 2, FUN = sum)
+```
+
+
+```{r}
+apply(is.na(test_data_with_nulls), 2, FUN = sum)
+```
+
+# Save datasets
+
+```{r}
+# Save train data
+write.csv(train_data_with_nulls, file = "train_data_with_nulls_df.csv", row.names = FALSE)
+```
+
+```{r}
+# Save test data
+write.csv(test_data_with_nulls, file = "test_data_with_nulls_df.csv", row.names = FALSE)
+```
+
+
