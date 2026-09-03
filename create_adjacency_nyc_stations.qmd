@@ -1,0 +1,309 @@
+---
+title: "Creating the NYC Subway Station Complex Adjacency Matrix - DS 440 Team 2"
+author: "Jason Ficorilli"
+format: html
+editor: source
+---
+
+# Loading relevant packages
+
+```{r, warning=FALSE, message=FALSE}
+library(tidyverse)
+library(igraph)
+library(ggraph)
+```
+
+# Load data
+
+```{r}
+stations_df <- read.csv("MTA_Subway_Stations_20260227.csv")
+df <- read.csv("2022-2024_MTA_Subway_Hourly_Ridership.csv")
+```
+
+
+# Create ridership df with fixed (POSIX) timestamps and stations without Staten Island railway
+
+```{r}
+df_test <- df %>% 
+  mutate(transit_timestamp = as.POSIXlt(strptime(transit_timestamp, "%m/%d/%Y %I:%M:%S %p"))) %>%
+  mutate(year = year(transit_timestamp), month = month(transit_timestamp), day = day(transit_timestamp), hour = hour(transit_timestamp))
+```
+
+```{r}
+stations_df_no_SI <- stations_df %>% filter(Borough != "SI")
+```
+
+
+# See which ridership station complexes are not in the stations dataset 
+
+```{r}
+df_test %>%
+  group_by(station_complex_id, station_complex) %>%
+  summarize() %>%
+  mutate(in_stations_df = if_else(station_complex_id %in% stations_df_no_SI$Complex.ID, 1, 0)) %>%
+  arrange(in_stations_df) %>%
+  View()
+
+# From this, we need to remove station complex ID 502 from the final ridership data (completed in next code block)
+```
+
+
+# Create complex id list without missing station complexes
+
+```{r}
+station_complex_id_name_df <- df_test %>%
+  filter(station_complex_id != 502) %>%
+  group_by(station_complex_id, station_complex) %>%
+  summarize()
+
+station_complex_id_list <- station_complex_id_name_df$station_complex_id
+```
+
+# Remove all service extended rush hours peak direction trains (A and 5 extended service, and the Z train)
+
+```{r}
+# Remove A extended service (stations are still connected by an S train)
+for(id in 200:203){ # remove A extended service (stations are still connected by an S train)
+  stations_df_no_SI[stations_df_no_SI$Station.ID == id, "Daytime.Routes"] <- gsub("A ", "", stations_df_no_SI[stations_df_no_SI$Station.ID == id, "Daytime.Routes"])
+}
+
+# Remove 5 extended service (stations are still connected by the 2 train)
+for(id in 425:417){ # remove 5 extended service (stations are still connected by the 2 train)
+  stations_df_no_SI[stations_df_no_SI$Station.ID == id, "Daytime.Routes"] <- gsub(" 5", "", stations_df_no_SI[stations_df_no_SI$Station.ID == id, "Daytime.Routes"])
+}
+
+# Remove the Z train (stations are still connected by the J train)
+for(id in c(80, 82, 83, 85, 87, 88, 90, 91, 92, 93, 95, 97, 101, 102, 103, 104, 105, 106, 107, 278, 279)){
+  stations_df_no_SI[stations_df_no_SI$Station.ID == id, "Daytime.Routes"] <- gsub(" Z", "", stations_df_no_SI[stations_df_no_SI$Station.ID == id, "Daytime.Routes"])
+}
+```
+
+# Separate the S trains by borough and the A train Rockaway Line portion
+
+```{r}
+stations_df_no_SI <- stations_df_no_SI %>%
+  mutate(Daytime.Routes = if_else(Line == "Rockaway" & grepl("A", Daytime.Routes) == TRUE, gsub("A", "a_rockaway", Daytime.Routes), Daytime.Routes)) %>%
+  mutate(Daytime.Routes = if_else(Borough == "Bk" & grepl("S", Daytime.Routes) == TRUE, gsub("S", "Sk", Daytime.Routes), Daytime.Routes)) %>%
+  mutate(Daytime.Routes = if_else(Borough == "Q" & grepl("S", Daytime.Routes) == TRUE, gsub("S", "Sq", Daytime.Routes), Daytime.Routes)) %>%
+  mutate(Daytime.Routes = if_else(Borough == "M" & grepl("S", Daytime.Routes) == TRUE, gsub("S", "Sm", Daytime.Routes), Daytime.Routes))
+```
+
+
+# Create list of all subway trains in the stations df
+
+```{r}
+trains_list <- c()
+
+for(route in stations_df_no_SI$Daytime.Routes){
+  for(train in unlist(str_split(route, pattern = " "))){
+    if(!(train %in% trains_list)){
+      trains_list <- append(trains_list, train)
+    }
+  }
+}
+```
+
+
+
+# Create one-hot-encoded representation of all daytime services at each station and if station is a north or south direction last stop
+
+```{r}
+for(train in trains_list){
+  stations_df_no_SI <- stations_df_no_SI %>% 
+    mutate(!!paste("services_daytime_", train, "_train", sep = "") := if_else(grepl(train, Daytime.Routes), 1, 0)) %>%
+    mutate(is_a_last_stop = if_else((grepl("Last Stop", North.Direction.Label) == TRUE) | (grepl("Last Stop", South.Direction.Label) == TRUE), 1, 0))
+}
+```
+
+
+# Check if all train services have at least one "last stop" indicator (only B and C do not) 
+
+```{r}
+for(train in trains_list){
+  temp_df <- stations_df_no_SI %>% filter(get(paste("services_daytime_", train, "_train", sep="")) == 1)
+    if(!("Last Stop" %in% temp_df$North.Direction.Label) & !("Last Stop" %in% temp_df$South.Direction.Label)){
+      cat(train, "")
+    }
+}
+```
+
+# Create sparse adjacency matrix
+
+```{r}
+adjacency_matrix <- matrix(c(rep(0, length(station_complex_id_list)), rep(0, length(station_complex_id_list))), nrow = length(station_complex_id_list), ncol = length(station_complex_id_list), dimnames = list(station_complex_id_list, station_complex_id_list))
+```
+
+# Populate adjacency matrix
+
+```{r}
+for(train in trains_list){
+  stations_servicing_train_df <- stations_df_no_SI %>% filter(get(paste("services_daytime_", train, "_train", sep="")) == 1)
+  
+  for(i in 1:1:(dim(stations_servicing_train_df)[1] - 1)){
+    if(i == 1){
+      if(train == "B" | train == "C"){
+        
+        # Start with northernmost station
+        last_stops_train_df <- stations_servicing_train_df %>% arrange(desc(GTFS.Latitude))
+        
+        station_complex_id <- last_stops_train_df$Complex.ID[1]
+        station_latitude <- last_stops_train_df$GTFS.Latitude[1]
+        station_longitude <- last_stops_train_df$GTFS.Longitude[1]
+        
+        closest_station_id <- 9999999 # set temporary closest station ID
+        closest_station_distance <- 9999999 # set temporary closest station distance
+        
+        stations_servicing_train_reduced_df <- stations_servicing_train_df %>% filter(Complex.ID != station_complex_id)
+      } else{
+        # Start with a last stop station
+        last_stops_train_df <- stations_servicing_train_df %>% filter(is_a_last_stop == 1)
+        
+        station_complex_id <- last_stops_train_df$Complex.ID[1]
+        station_latitude <- last_stops_train_df$GTFS.Latitude[1]
+        station_longitude <- last_stops_train_df$GTFS.Longitude[1]
+        
+        closest_station_id <- 9999999
+        closest_station_distance <- 9999999
+        
+        stations_servicing_train_reduced_df <- stations_servicing_train_df %>% filter(Complex.ID != station_complex_id)
+      }
+      
+    }
+    
+    for(j in 1:dim(stations_servicing_train_reduced_df)[1]){ # Check all connected stations and update closest distance and ID
+      if(closest_station_distance > sqrt(((station_longitude - stations_servicing_train_reduced_df$GTFS.Longitude[j])**2) + ((station_latitude - stations_servicing_train_reduced_df$GTFS.Latitude[j])**2))){
+        closest_station_id <- stations_servicing_train_reduced_df$Complex.ID[j]
+        closest_station_distance <- sqrt(((station_longitude - stations_servicing_train_reduced_df$GTFS.Longitude[j])**2) + ((station_latitude - stations_servicing_train_reduced_df$GTFS.Latitude[j])**2))  
+      }
+    }
+  
+    if((adjacency_matrix[as.character(station_complex_id), as.character(closest_station_id)] == 0) & (adjacency_matrix[as.character(closest_station_id), as.character(station_complex_id)] == 0)){ # Update adj matrix if not updated already
+        adjacency_matrix[as.character(station_complex_id), as.character(closest_station_id)] <- 1
+        adjacency_matrix[as.character(closest_station_id), as.character(station_complex_id)] <- 1 
+    }
+    
+    if(dim(stations_servicing_train_reduced_df)[1] != 0){ # Remove current station from consideration by switching to closest station and resetting temporary distance and ID values
+      station_complex_id <- closest_station_id
+      station_latitude <- stations_servicing_train_df %>% 
+        filter(Complex.ID == station_complex_id) %>%
+        pull(GTFS.Latitude)
+      station_longitude <- stations_servicing_train_df %>% 
+        filter(Complex.ID == station_complex_id) %>%
+        pull(GTFS.Longitude)
+      
+      closest_station_id <- 9999999
+      closest_station_distance <- 9999999
+      
+      stations_servicing_train_reduced_df <- stations_servicing_train_reduced_df %>% filter(Complex.ID != station_complex_id)
+    }
+  }
+}
+
+# Handle edge case of Rockaway Blvd being connected to Aqueduct Racetrack
+adjacency_matrix[as.character(192), as.character(196)] <- 1
+adjacency_matrix[as.character(196), as.character(192)] <- 1 
+
+```
+
+
+## Save adjacency matrix
+
+```{r}
+# write.csv(adjacency_matrix, file = "SC_adjacency_matrix.csv")
+```
+
+
+## Create Station Complex Centroid Latitude and Longitude Coordinates DF
+```{r}
+# Centroid calculated using the mean of x coords and mean of y coords
+SC_centroid_coords_df <- stations_df_no_SI %>%
+  group_by(Complex.ID, Borough) %>%
+  summarize(centroid_latitude = mean(GTFS.Latitude), centroid_longitude = mean(GTFS.Longitude)) %>%
+
+  # Add complete borough names
+  mutate(Borough = if_else(Borough == "M", "Manhattan", Borough)) %>%
+  mutate(Borough = if_else(Borough == "Bk", "Brooklyn", Borough)) %>%
+  mutate(Borough = if_else(Borough == "Bx", "The Bronx", Borough)) %>%
+  mutate(Borough = if_else(Borough == "Q", "Queens", Borough)) %>% 
+  
+  # Get station complex names
+  left_join(station_complex_id_name_df %>% rename("Complex.ID" = "station_complex_id"), join_by(Complex.ID))
+```
+
+## Get edge counts for each station and add them to Station Complex Centroid Latitude and Longitude Coordinates DF
+
+```{r}
+sc_edge_counts <- c()
+for(id in SC_centroid_coords_df$Complex.ID){
+  sc_edge_counts <- append(sc_edge_counts, sum(adjacency_matrix[as.character(id), ]))
+}
+
+SC_centroid_coords_df$SC_edge_counts <- sc_edge_counts
+```
+
+
+## Visualize adjacency matrix as a graph network
+```{r}
+network <- graph_from_adjacency_matrix(adjmatrix = adjacency_matrix, mode="undirected")
+```
+
+
+```{r, warning=FALSE}
+ggraph(network, layout = "manual", x = SC_centroid_coords_df$centroid_longitude, y = SC_centroid_coords_df$centroid_latitude) +
+  geom_edge_link(edge_color = "grey") +
+  geom_node_point(
+    aes(col = SC_centroid_coords_df$Borough),
+    show.legend = TRUE) +
+  # geom_node_text(aes(label = SC_centroid_coords_df$station_complex), repel = TRUE, check_overlap = TRUE)+ # add some station name labels
+  labs(title = "Adjacency Matrix Network of NYC Subway Stations", color = "Borough")
+```
+
+```{r, warning=FALSE}
+ggraph(network, layout = "manual", x = SC_centroid_coords_df$centroid_longitude, y = SC_centroid_coords_df$centroid_latitude) +
+  geom_edge_link(edge_color = "grey") +
+  geom_node_point(
+    aes(col = SC_centroid_coords_df$SC_edge_counts),
+    show.legend = TRUE) +
+  # geom_node_text(aes(label = SC_centroid_coords_df$station_complex), repel = TRUE, check_overlap = TRUE)+ # add some station name labels
+  labs(title = "Adjacency Matrix Network of NYC Subway Stations by Connected Station Counts", color = "Connected Station Count")
+```
+
+
+# Checking results
+
+## Checking results for A, 2, and 5 train edge cases
+
+```{r}
+stations_df_no_SI %>% filter(services_daytime_A_train == 1) %>% View()
+```
+
+```{r}
+stations_df_no_SI %>% filter(services_daytime_a_rockaway_train == 1) %>% View()
+```
+
+```{r}
+stations_df_no_SI %>% filter(services_daytime_Sq_train == 1) %>% View()
+```
+
+
+```{r}
+stations_df_no_SI %>% filter(services_daytime_2_train == 1) %>% View()
+```
+
+```{r}
+stations_df_no_SI %>% filter(services_daytime_5_train == 1) %>% View()
+```
+
+
+# View train services as a plot
+
+```{r}
+ggplot(data = stations_df_no_SI %>% filter(services_daytime_5_train == 1), aes(x = GTFS.Longitude, y = GTFS.Latitude, color = Stop.Name)) +
+  geom_point()
+```
+
+```{r}
+stations_df_no_SI %>% filter(services_daytime_5_train == 1) %>% arrange(desc(GTFS.Latitude)) %>% View()
+```
+
+
